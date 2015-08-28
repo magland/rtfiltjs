@@ -3,9 +3,10 @@ var fs=require('fs');
 var input_path=process.argv[2]||'/home/magland/data/EJ/Spikes_all_channels_filtered.mda';
 var output_path=process.argv[3]||'tmp/rtfilt/out.dat';
 var num_channels=512;
-var chunk_size=100000;
-var num_workers=20;
-var num_chunks=6;
+var chunk_size=1200000;
+var num_workers=100;
+var num_chunks=1;
+var use_srun=1;
 if (num_workers>num_channels) num_workers=num_channels;
 
 var JM=new JJobManager();
@@ -60,18 +61,29 @@ function RtfiltController() {
 			m_worker_jobs=[];
 			mkdir('tmp/rtfilt/step2');
 			var JD=new DistributorJob(m_chunks_to_be_processed[0],'tmp/rtfilt/step2/distributed-',opts);
+			JD.distributor_timer=new Date();
 			m_chunks_to_be_processed=m_chunks_to_be_processed.slice(1);
 			JD.onFinished(function() {
+				var elapsed_distributor=(new Date())-JD.distributor_timer;
+				var MBs=(opts.chunk_size*num_channels*4/1000000)/(elapsed_distributor/1000);
+				console.log('Elapsed time for distributor: '+elapsed_distributor+' #bytes distributed: '+(opts.chunk_size*num_channels*4)+' rate: '+MBs+'MB/s')
 				var paths=JD.outputPaths();
-				var num_channels_per_worker=Math.ceil(num_channels/num_workers);
+				var exec_delay_timer=new Date();
 				for (var i=0; i<paths.length; i++) {
-					var num_channels0=num_channels_per_worker;
-					if ((num_channels_per_worker)*(i+1)>opts.num_channels) num_channels0=opts.num_channels-num_channels_per_worker*i;
-					console.log(num_channels0);
-					var JW=new WorkerJob(paths[i],paths[i]+'.out',opts);
-					JW.setNumChannels(num_channels0);
-					m_worker_jobs.push(JW);
-					m_job_manager.startJob(JW);
+					(function() {
+						var num_channels0=Math.floor(opts.num_channels*(i+1)/num_workers)-Math.floor(opts.num_channels*i/num_workers);
+						var JW=new WorkerJob(paths[i],paths[i]+'.out',opts);
+						JW.setNumChannels(num_channels0);
+						JW.worker_timer=new Date();
+						m_worker_jobs.push(JW);
+						m_job_manager.startJob(JW);
+						//console.log('Exec delay: '+((new Date())-exec_delay_timer));
+						JW.onFinished(function() {
+							var elapsed_worker=(new Date())-JW.worker_timer;
+							var elapsed_worker2=(new Date())-exec_delay_timer;
+							console.log('Elapsed time for worker: '+elapsed_worker+' : '+elapsed_worker2);
+						});
+					})();
 				}
 				m_distributor_job=0;
 			});
@@ -87,8 +99,13 @@ function RtfiltController() {
 		}
 	}
 	setTimeout(on_timer,1);
-	
 }
+
+function write_text_file(path,str) {
+	fs.writeFileSync(path,str);
+}
+
+
 
 function JJobManager() {
 	this.startJob=function(job) {m_jobs.push(job); job.onFinished(function() {remove_job(job)}); job.startJob();}
@@ -131,13 +148,9 @@ function WorkerJob(input_path,output_path,opts) {
 	var m_num_channels=0;
 
 	function _startJob() {
-		console.log(opts);
 		var exe=__dirname+'/bin/rtfilt';
 		var args=['filter',input_path,output_path,m_num_channels,opts.chunk_size];
-		console.log(exe);
-		console.log(args);
-		exec_process(exe,args,function(a) {
-			console.log(a);
+		exec_process(exe,args,{srun:use_srun},function(a) {
 			that.endJob();
 		});
 	}
@@ -158,7 +171,7 @@ function DistributorJob(input_path,output_prefix,opts) {
 		}
 		var exe=__dirname+'/bin/rtfilt';
 		var args=['distribute',input_path,output_prefix,opts.num_channels,opts.chunk_size,opts.num_workers];
-		exec_process(exe,args,function(a,b,c) {
+		exec_process(exe,args,{srun:use_srun},function(a,b,c) {
 			that.endJob();
 		});
 	}
@@ -183,8 +196,11 @@ function ReaderJob(input_path,output_prefix,opts) {
 		var current_num_bytes_written=0;
 		var current_WS=fs.createWriteStream(current_chunk_path);
 
+		var reader_timer=new Date();
+		var reader_bytes=0;
 		var SS=fs.createReadStream(input_path);
 		SS.on('data',function(dd) {
+			reader_bytes+=dd.length;
 			if (that.isFinished()) return;
 			while (dd.length>0) {
 				if (current_num_bytes_written+dd.length<m_bytes_per_chunk) {
@@ -200,6 +216,10 @@ function ReaderJob(input_path,output_prefix,opts) {
 					current_chunk_number++;
 					on_chunk_read(current_chunk_path);
 					if (current_chunk_number>=opts.num_chunks) {
+						reader_timer_elapsed=(new Date())-reader_timer;
+						console.log('Elapsed time for reader: '+reader_timer_elapsed+' bytes read: '+reader_bytes+' mb/sec: '
+							+((reader_bytes/1000000)/(reader_timer_elapsed/1000)));
+
 						dd=new Buffer(0);
 						SS.destroy();
 						that.endJob();
@@ -224,14 +244,43 @@ function ReaderJob(input_path,output_prefix,opts) {
 	}
 }
 
-function exec_process(exe,args,callback) {
+function exec_process(exe,args,opts,callback) {
+	if (opts.srun) {
+		var cmd='srun'
+		args.splice(0,0,exe);
+	}
+	else {
+		cmd=exe;
+	}
+	var cmdstr=cmd;
+	for (var i=0; i<args.length; i++) cmdstr+=' '+args[i];
+	console.log('Executing: '+cmdstr);
+	
+	var spawn = require('child_process').spawn;
+    var XX = spawn(cmd,args);
+    XX.stdout.on('data', function(data) {
+         console.log(data.toString());
+    });
+    XX.stderr.on('data', function(data) {
+         console.log(data.toString());
+    });
+    XX.on('close', function(code) {
+        return callback(code);
+    });
+	
+}
+
+/*function exec_process(exe,args,callback) {
 	var cmd='srun '+exe;
 	for (var i=0; i<args.length; i++) {
 		cmd+=' '+args[i];
 	}
-	console.log('executing: '+cmd);
-	require('child_process').exec(cmd,callback);
-}
+	console.log ('executing: '+cmd);
+	require('child_process').exec(cmd,function(err,output) {
+		if (output) console.log(output);
+		callback(err,output);
+	});
+}*/
 
 function mkdir(path) {
 	try {
